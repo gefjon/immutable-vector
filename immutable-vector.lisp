@@ -1,16 +1,21 @@
 (uiop:define-package :immutable-vector/immutable-vector
   (:nicknames :immutable-vector)
   (:import-from :alexandria
-                #:array-index #:array-length)
+                #:array-index #:array-length #:define-constant)
   (:use :cl :iterate)
-  (:local-nicknames (:g :generator))
+  (:local-nicknames (:g :generator)
+                    (:nr :named-readtables))
   (:export
    #:immutable-vector
    #:make-vec
    #:vecref #:vec-length
    #:push-back
-   #:generate-immutable-vector))
+   #:generate-immutable-vector
+
+   #:immutable-vector-readtable))
 (in-package :immutable-vector/immutable-vector)
+
+;;; defs
 
 (eval-when (:compile-toplevel :load-toplevel)
   (defconstant +vec-branch-rate+ 16)
@@ -20,19 +25,36 @@
   `(integer 0 ,+max-depth+))
 
 (deftype chunk ()
+  "A contiguous segment of a trie"
   `(simple-vector ,+vec-branch-rate+))
+
+(defstruct (uninit (:predicate uninitp))
+  "Sentinel value for uninitialized elements of tries.")
+
+(define-constant +uninit+ (make-uninit)
+  :test (lambda (lhs rhs)
+          (and (uninitp lhs) (uninitp rhs)))
+  :documentation "Sentinel value for uninitialized elements of tries.
+
+Test for this using `uninitp', not `eq' on this constant.")
+
+(defmethod print-object ((obj uninit) stream)
+  (write-string "#." stream)
+  (write '+uninit+ :stream stream))
 
 (declaim (ftype (function ((g:generator t &optional)) (values chunk &optional))
                 alloc-chunk))
 (defun alloc-chunk (contents-iterator
-                    &aux (contents (g:concatenate contents-iterator (g:always '#:uninit))))
+                    &aux (contents (g:concatenate contents-iterator (g:always +uninit+))))
+  "Construct a `chunk' with elements taken from CONTENTS-ITERATOR, and remaining elements set to `+uninit+'"
   (let* ((arr (make-array +vec-branch-rate+)))
     (iter (declare (declare-variables))
       (for (the fixnum i) below +vec-branch-rate+)
       (setf (svref arr i) (g:next contents)))
     arr))
 
-(deftype one-index ()
+(deftype chunk-index ()
+  "An index into a `chunk'"
   `(integer 0 (,+vec-branch-rate+)))
 
 (deftype tail-buf ()
@@ -61,6 +83,8 @@
   (tail +empty-tail+
    :type tail-buf))
 
+;;; indexing into immutable-vectors
+
 (declaim (ftype (function (immutable-vector) (values array-index &optional))
                 tail-length body-length vec-length))
 (defun tail-length (vec &aux (tail (%vec-tail vec)))
@@ -85,7 +109,7 @@ Does not necessarily imply that IDX is in-bounds for VEC."
   "aref into the tail of VEC. IDX must be in-bounds for VEC, and must be `index-in-tail-p'"
   (svref (%vec-tail vec) (- idx (body-length vec))))
 
-(declaim (ftype (function (depth array-index) (values one-index array-index &optional))
+(declaim (ftype (function (depth array-index) (values chunk-index array-index &optional))
                 depth-index)
          (inline depth-index))
 (defun depth-index (depth index)
@@ -144,6 +168,8 @@ Does not necessarily imply that IDX is in-bounds for VEC."
         ((index-in-tail-p vec idx) (tailref vec idx))
         (t (bodyref vec idx))))
 
+;;; constructing immutable-vectors
+
 (declaim (ftype (function (array-index) (values depth &optional))
                 length-required-depth))
 (defun length-required-depth (length)
@@ -193,37 +219,12 @@ Does not necessarily imply that IDX is in-bounds for VEC."
       (alloc-chunk contents)
       (alloc-chunk (chunks-generator (1- depth) length contents))))
 
-(declaim (ftype (function (immutable-vector) (values (g:generator t &optional) &optional))
-                generate-immutable-vector))
-(defun generate-immutable-vector (vec)
-  "Generate successive elements from the `immutable-vector' VEC"
-  (let* ((current-index -1))
-    (declare (type (or array-index (eql -1)) current-index))
-    (labels ((inbounds-advance ()
-               (incf current-index)
-               (vecref vec current-index))
-             (vec-iter ()
-               (if (>= current-index (1- (%vec-length vec)))
-                   (g:done)
-                   (inbounds-advance))))
-      #'vec-iter)))
-
-(defmethod print-object ((vec immutable-vector) stream)
-  (write-string "#[" stream)
-  (g:do-generator (elt (generate-immutable-vector vec))
-    (write-char #\space stream)
-    (write elt :stream stream))
-  (write-string "]" stream))
-
-(defmethod g:make-generator ((vec immutable-vector))
-  (generate-immutable-vector vec))
-
 (declaim (ftype (function (array-length) (values array-length &optional))
                 length-without-partial-chunks))
 (defun length-without-partial-chunks (total-length)
   (* +vec-branch-rate+ (floor total-length +vec-branch-rate+)))
 
-(declaim (ftype (function (one-index (g:generator t &rest t))
+(declaim (ftype (function (chunk-index (g:generator t &rest t))
                           (values tail-buf &optional))
                 make-tail))
 (defun make-tail (length contents)
@@ -259,6 +260,8 @@ Does not necessarily imply that IDX is in-bounds for VEC."
              :body body
              :tail tail))
 
+;;; the push-back operator
+
 (declaim (ftype (function (tail-buf) (values boolean &optional))
                 tail-has-room-p))
 (defun tail-has-room-p (tail)
@@ -286,25 +289,99 @@ Does not necessarily imply that IDX is in-bounds for VEC."
   (if (zerop depth) body
       (alloc-chunk (g:generate-list (list body)))))
 
+(declaim (ftype (function ((or chunk uninit) chunk depth array-length)
+                          (values chunk &optional))
+                grow-trie))
+(defun grow-trie (trie new-chunk depth new-length)
+  "Return a new trie of DEPTH and LENGTH which is like TRIE but with NEW-CHUNK stuck on the end.
+
+TRIE must have DEPTH, must have length of (- NEW-LENGTH (length NEW-CHUNK)), and must have space for at least
+one more chunk while staying at DEPTH."
+  ;; you'll always have to allocate exactly one new spine node at each depth.
+  (cond ((zerop depth) new-chunk)
+        ((uninitp trie) (wrap-in-spine depth new-chunk))
+        (t
+         (let* ((length-before-in-elts (- new-length (length new-chunk)))
+                (elts-per-chunk (elts-per-chunk (1- depth)))
+                (length-before-in-chunks (floor length-before-in-elts
+                                                elts-per-chunk)))
+           (alloc-chunk (g:concatenate (g:take (g:generate-vector trie) length-before-in-chunks)
+                                       (g:generate-these (grow-trie (svref trie length-before-in-chunks)
+                                                                    new-chunk
+                                                                    (1- depth)
+                                                                    elts-per-chunk))))))))
+
 (declaim (ftype (function (t immutable-vector) (values immutable-vector &optional))
                 push-back))
 (defun push-back (new-element vec)
   (with-accessors ((depth %vec-depth)
+                   (length %vec-length)
                    (tail %vec-tail)
                    (body %vec-body))
       vec
     (cond ((tail-has-room-p tail)
            ;; fast path when your tail is short: make it longer
-           (copy-vec vec :tail (vector-push-back new-element tail)))
+           (copy-vec vec
+                     :tail (vector-push-back new-element tail)
+                     :length (1+ length)))
           ((= (body-length vec) (max-length-at-depth depth))
            ;; fast path when your tail and body are both full: grow an extra layer of depth, put your old tail
            ;; in the newly-expanded body, then grow a new tail
            (copy-vec vec
                      :depth (1+ depth)
+                     :length (1+ length)
                      :body (alloc-chunk (g:generate-these body
                                                           (wrap-in-spine depth tail)))
                      :tail (vector new-element)))
-          ((error "unimplemented")
+          (t
            ;; slow path: move your full tail into your not-full body, trying your best to preserve as much
            ;; structure as possible, then grow a new tail.
-           ))))
+           (copy-vec vec
+                     :depth depth
+                     :length (1+ length)
+                     :body (grow-trie body tail depth length)
+                     :tail (vector new-element))))))
+
+;;; generators of immutable-vector elements
+
+(declaim (ftype (function (immutable-vector) (values (g:generator t &optional) &optional))
+                generate-immutable-vector))
+(defun generate-immutable-vector (vec)
+  "Generate successive elements from the `immutable-vector' VEC"
+  (let* ((current-index -1))
+    (declare (type (or array-index (eql -1)) current-index))
+    (labels ((inbounds-advance ()
+               (incf current-index)
+               (vecref vec current-index))
+             (vec-iter ()
+               (if (>= current-index (1- (%vec-length vec)))
+                   (g:done)
+                   (inbounds-advance))))
+      #'vec-iter)))
+
+(defmethod g:make-generator ((vec immutable-vector))
+  (generate-immutable-vector vec))
+
+;;; reading and printing immutable-vectors
+
+(declaim (ftype (function (stream character (or null fixnum))
+                          (values immutable-vector &optional))
+                read-vec))
+(defun read-vec (stream open infix)
+  (declare (ignore infix open))
+  (let* ((elts (read-delimited-list #\] stream t))
+         (len (length elts)))
+    (make-vec len (g:generate-list elts))))
+
+(nr:defreadtable immutable-vector-readtable
+  (:merge :standard)
+  (:dispatch-macro-char #\# #\[ #'read-vec)
+  (:syntax-from :standard #\) #\]))
+
+(defmethod print-object ((vec immutable-vector) stream)
+  (write-string "#[" stream)
+  (g:do-generator (elt (generate-immutable-vector vec))
+    (write-char #\space stream)
+    (write elt :stream stream))
+  (write-string "]" stream))
+
