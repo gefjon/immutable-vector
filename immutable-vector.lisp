@@ -304,12 +304,14 @@ one more chunk while staying at DEPTH."
          (let* ((length-before-in-elts (- new-length (length new-chunk)))
                 (elts-per-chunk (elts-per-chunk (1- depth)))
                 (length-before-in-chunks (floor length-before-in-elts
-                                                elts-per-chunk)))
+                                                elts-per-chunk))
+                (length-in-last-chunk (- new-length (* length-before-in-chunks elts-per-chunk))))
            (alloc-chunk (g:concatenate (g:take (g:generate-vector trie) length-before-in-chunks)
                                        (g:generate-these (grow-trie (svref trie length-before-in-chunks)
                                                                     new-chunk
                                                                     (1- depth)
-                                                                    elts-per-chunk))))))))
+                                                                    ;; FIXME: pass correct size of final chunk when less than ELTS-PER-CHUNK
+                                                                    length-in-last-chunk))))))))
 
 (declaim (ftype (function (t immutable-vector) (values immutable-vector &optional))
                 push-back))
