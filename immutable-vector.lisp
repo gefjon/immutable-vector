@@ -1,7 +1,7 @@
 (uiop:define-package :immutable-vector/immutable-vector
   (:nicknames :immutable-vector)
   (:import-from :alexandria
-                #:array-index #:array-length #:define-constant)
+                #:array-index #:array-length #:define-constant #:when-let)
   (:use :cl :iterate)
   (:local-nicknames (:g :generator)
                     (:nr :named-readtables))
@@ -11,6 +11,8 @@
    #:vecref #:vec-length
    #:push-back
    #:generate-immutable-vector
+   #:list-vec #:vector-vec
+   #:vec-list #:vec-vector
 
    #:immutable-vector-readtable))
 (in-package :immutable-vector/immutable-vector)
@@ -28,8 +30,9 @@
   "A contiguous segment of a trie"
   `(simple-vector ,+vec-branch-rate+))
 
-(defstruct (uninit (:predicate uninitp))
-  "Sentinel value for uninitialized elements of tries.")
+(eval-when (:compile-toplevel :load-toplevel)
+  (defstruct (uninit (:predicate uninitp))
+    "Sentinel value for uninitialized elements of tries."))
 
 (define-constant +uninit+ (make-uninit)
   :test (lambda (lhs rhs)
@@ -79,7 +82,7 @@ Test for this using `uninitp', not `eq' on this constant.")
    ;; a trie of `+vec-branch-rate+'-element chunks. restrictions:
    ;; - all leaves are at the same depth, DEPTH
    ;; - no leaf is partially full; every leaf holds exactly `+vec-branch-rate+' elements.
-   :type chunk)
+   :type (or chunk uninit))
   (tail +empty-tail+
    :type tail-buf))
 
@@ -194,7 +197,7 @@ Does not necessarily imply that IDX is in-bounds for VEC."
   (min max (max middle min)))
 
 (declaim (ftype (function (depth array-index (g:generator t &rest t))
-                          (values chunk &optional))
+                          (values (or chunk uninit) &optional))
                 alloc-trie))
 
 (declaim (ftype (function (depth array-index (g:generator t &optional))
@@ -215,9 +218,9 @@ Does not necessarily imply that IDX is in-bounds for VEC."
 
 (defun alloc-trie (depth length contents)
   (assert (<= 0 length (expt +vec-branch-rate+ (1+ depth))))
-  (if (zerop depth)
-      (alloc-chunk contents)
-      (alloc-chunk (chunks-generator (1- depth) length contents))))
+  (cond ((zerop length) +uninit+)
+        ((zerop depth) (alloc-chunk contents))
+        (:otherwise (alloc-chunk (chunks-generator (1- depth) length contents)))))
 
 (declaim (ftype (function (array-length) (values array-length &optional))
                 length-without-partial-chunks))
@@ -305,6 +308,8 @@ one more chunk while staying at DEPTH."
                 (elts-per-chunk (elts-per-chunk (1- depth)))
                 (length-before-in-chunks (floor length-before-in-elts
                                                 elts-per-chunk))
+                ;; OPTIMIZE: there's potential to do a bit-shift here instead of a multiply, and to convince
+                ;; sbcl that the result will fit in a fixnum.
                 (length-in-last-chunk (- new-length (* length-before-in-chunks elts-per-chunk))))
            (alloc-chunk (g:concatenate (g:take (g:generate-vector trie) length-before-in-chunks)
                                        (g:generate-these (grow-trie (svref trie length-before-in-chunks)
@@ -380,10 +385,42 @@ one more chunk while staying at DEPTH."
   (:dispatch-macro-char #\# #\[ #'read-vec)
   (:syntax-from :standard #\) #\]))
 
-(defmethod print-object ((vec immutable-vector) stream)
+(defmethod print-object ((vec immutable-vector) stream
+                         &aux (gen (generate-immutable-vector vec)))
   (write-string "#[" stream)
-  (g:do-generator (elt (generate-immutable-vector vec))
+  (multiple-value-bind (foundp elt) (g:try-next gen nil)
+    (when foundp
+      (write elt :stream stream)))
+  (g:do-generator (elt gen)
     (write-char #\space stream)
     (write elt :stream stream))
   (write-string "]" stream))
+
+;;; public conversion functions
+
+(declaim (ftype (function (list)
+                          (values immutable-vector &optional))
+                list-vec))
+(defun list-vec (list)
+  (make-vec (length list)
+            (g:generate-list list)))
+
+(declaim (ftype (function (vector)
+                          (values immutable-vector &optional))
+                vector-vec))
+(defun vector-vec (vector)
+  (make-vec (length vector)
+            (g:generate-vector vector)))
+
+(declaim (ftype (function (immutable-vector)
+                          (values list &optional))
+                vec-list))
+(defun vec-list (vec)
+  (g:collect-to-list (generate-immutable-vector vec)))
+
+(declaim (ftype (function (immutable-vector)
+                          (values vector &optional))
+                vec-vector))
+(defun vec-vector (vec)
+  (g:collect-to-vector (generate-immutable-vector vec)))
 
