@@ -7,13 +7,18 @@ on:
   pull_request:
     branches: [ master ]
   # manually
-  repository_dispatch:
+  workflow_dispatch:
 
 jobs:
   test:
     # i don't care enough to test on multiple platforms or multiple impls
     runs-on: ubuntu-latest
     steps:
+      - name: checkout generator
+        uses: actions/checkout@v2
+        with:
+          repository: gefjon/generator
+          path: gefjon/generator
       - uses: gefjon/github-action-lisp-ci@v1
         with:
           system-name: 'immutable-vector'
