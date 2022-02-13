@@ -113,9 +113,9 @@ Does not necessarily imply that IDX is in-bounds for VEC."
   (svref (%vec-tail vec) (- idx (body-length vec))))
 
 (declaim (ftype (function (depth array-index) (values chunk-index array-index &optional))
-                depth-index)
-         (inline depth-index))
-(defun depth-index (depth index)
+                index-at-depth)
+         (inline index-at-depth))
+(defun index-at-depth (depth index)
   (let ((depth-low-bit (* depth 4)))
     (values (ldb (byte 4 depth-low-bit)
                  index)
@@ -127,7 +127,7 @@ Does not necessarily imply that IDX is in-bounds for VEC."
 (defun trieref (body depth idx)
   (if (zerop depth)
       (svref body idx)
-      (multiple-value-bind (curr remaining) (depth-index depth idx)
+      (multiple-value-bind (curr remaining) (index-at-depth depth idx)
         (trieref (svref body curr) (1- depth) remaining))))
 
 (declaim (ftype (function (t chunk depth array-index) (values t &optional))
@@ -135,7 +135,7 @@ Does not necessarily imply that IDX is in-bounds for VEC."
 (defun (setf trieref) (new-elt body depth idx)
   (if (zerop depth)
       (setf (svref body idx) new-elt)
-      (multiple-value-bind (curr remaining) (depth-index depth idx)
+      (multiple-value-bind (curr remaining) (index-at-depth depth idx)
         (setf (trieref (svref body curr) (1- depth) remaining)
               new-elt))))
 
